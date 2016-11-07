@@ -1,0 +1,13 @@
+#!/bin/bash
+
+if [ ${DIB_DEBUG_TRACE:-0} -gt 0 ]; then
+    set -x
+fi
+set -eu
+set -o pipefail
+
+# Missing dependencies for Heat tools
+yum install -y python2-oslo-log python-psutil
+
+# Dependencies for the NFS + Torque image
+yum install -y facter nfs-utils torque torque-server torque-scheduler torque-client torque-mom torque-libs

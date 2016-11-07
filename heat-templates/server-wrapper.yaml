@@ -1,0 +1,43 @@
+heat_template_version: 2016-04-08
+
+description: Deploys a single server
+
+parameters:
+  flavor:
+    type: string
+    description: flavor for the server to be created
+    constraints:
+      - custom_constraint: nova.flavor
+  image:
+    type: string
+    description: image ID or image name to use for the server
+    constraints:
+      - custom_constraint: glance.image
+  key_name:
+    type: string
+    description: existing key pair to use for the server
+    default: heat-key
+    constraints:
+      - custom_constraint: nova.keypair
+  name:
+    type: string
+    description: Name of the server
+
+resources:
+  server:
+    type: OS::Nova::Server
+    properties:
+      flavor: { get_param: flavor }
+      image: { get_param: image }
+      key_name: { get_param: key_name }
+      name: { get_param: name }
+      user_data_format: SOFTWARE_CONFIG
+      software_config_transport: POLL_SERVER_HEAT
+
+outputs:
+  server_id:
+    description: Nova ID of the deployed server
+    value: { get_resource: server }
+  first_address:
+    description: IP adddress of the deployed server
+    value: { get_attr: [server, first_address] }

@@ -1,0 +1,362 @@
+# This describes what is deployed by this template.
+description: NFS/PBS head and workers deployed with Heat
+
+# This defines the minimum Heat version required by this template.
+heat_template_version: 2015-10-15
+
+# The resources section defines what OpenStack resources are to be deployed and
+# how they should be configured.
+resources:
+  midas_client_keypair:
+    type: OS::Nova::KeyPair
+    properties:
+      save_private_key: true
+      name:
+        str_replace:
+          template: stack_name
+          params:
+            stack_name: { get_param: "OS::stack_name" }
+
+  configure_swift_server:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      group: script
+      config:
+        #!/bin/bash
+        # TODO For Justin to configure the server / head node with Swift
+
+  swift_server_sd:
+    type: OS::Heat::SoftwareDeployment
+    properties:
+      config: { get_resource: configure_swift_server }
+      server: { get_resource: midas_head }
+      signal_transport: HEAT_SIGNAL
+
+  configure_swift_worker:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      group: script
+      config:
+        #!/bin/bash
+        # TODO For Justin to configure a worker node with Swift
+
+  swift_workers_sd:
+    type: OS::Heat::SoftwareDeploymentGroup
+    properties:
+      config: { get_resource: configure_swift_worker }
+      servers: { get_attr: [midas_workers, attributes, server_id] }
+      signal_transport: HEAT_SIGNAL
+
+  configure_server:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      group: script
+      config:
+        str_replace:
+          params:
+            CLIENT_PUBLIC: { get_attr: [ midas_client_keypair, public_key ] }
+            CLIENT_PRIVATE: { get_attr: [ midas_client_keypair, private_key ] }
+          template: |
+            #!/bin/bash
+            yum install -y nfs-utils
+            echo '/home 192.168.0.0/24(rw,async)' >> /etc/exports
+            systemctl enable rpcbind && systemctl start rpcbind
+            systemctl enable nfs-server && systemctl start nfs-server
+
+            echo $(facter ipaddress) $(hostname) >> /etc/hosts
+
+            yum install -y torque torque-server torque-client torque-mom torque-libs torque-scheduler
+            echo $(hostname) > /var/lib/torque/server_name
+
+            cd /etc/munge
+            dd if=/dev/urandom bs=1 count=1024 > munge.key
+            chown munge munge.key
+            chmod 400 munge.key
+            systemctl enable munge.service
+            systemctl start munge.service
+
+            systemctl enable trqauthd.service
+            systemctl start trqauthd.service
+
+            yes | pbs_server -t create
+            sleep 1
+            pkill pbs_server
+            pgrep pbs_server && pkill -9 pbs_server
+
+            sudo systemctl enable pbs_server
+            sudo systemctl start pbs_server
+            sudo systemctl enable pbs_sched
+            sudo systemctl start pbs_sched
+
+            qmgr -c "set server acl_hosts = $(hostname)"
+            qmgr -c "set server scheduling=true"
+            qmgr -c "create queue batch queue_type=execution"
+            qmgr -c "set queue batch started=true"
+            qmgr -c "set queue batch enabled=true"
+            qmgr -c "set queue batch resources_default.nodes=1"
+            qmgr -c "set queue batch resources_default.walltime=3600"
+            qmgr -c "set server default_queue=batch"
+            qmgr -c "set server keep_completed = 86400"
+
+            pushd /home/centos/.ssh/
+            cat << EOF > id_rsa.pub
+            CLIENT_PUBLIC
+            EOF
+            cat id_rsa.pub >> authorized_keys
+
+            cat << EOF > id_rsa
+            CLIENT_PRIVATE
+            EOF
+
+            cat << EOF > config
+            Host *
+              StrictHostKeyChecking no
+            EOF
+
+            chmod 600 id_rsa authorized_keys
+            chmod 644 id_rsa.pub config
+            chown centos:centos *
+            popd
+
+  server_sd:
+    type: OS::Heat::SoftwareDeployment
+    properties:
+      config: { get_resource: configure_server }
+      server: { get_resource: midas_head }
+      signal_transport: HEAT_SIGNAL
+
+  configure_worker:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      group: script
+      config:
+        str_replace:
+          params:
+            MIDAS_HEAD_IP: { get_attr: [ midas_head, first_address ] }
+            MIDAS_HEAD_HOSTNAME: { get_attr: [ midas_head, name ] }
+            CLIENT_PUBLIC: { get_attr: [ midas_client_keypair, public_key ] }
+            CLIENT_PRIVATE: { get_attr: [ midas_client_keypair, private_key ] }
+          template: |
+            #!/bin/bash
+            yum install -y nfs-utils
+            echo "MIDAS_HEAD_IP:/home   /home    nfs" > /etc/fstab
+            mount -a
+
+            yum install -y torque torque-server torque-client torque-mom torque-libs
+
+            echo MIDAS_HEAD_IP MIDAS_HEAD_HOSTNAME >> /etc/hosts
+
+            cd /etc/munge
+            dd if=/dev/urandom bs=1 count=1024 > munge.key
+            chown munge munge.key
+            chmod 400 munge.key
+            systemctl enable munge.service
+            systemctl start munge.service
+
+            cat << EOF > /var/lib/torque/mom_priv/config
+            \$pbsserver MIDAS_HEAD_HOSTNAME
+            \$logevent  255
+            # /home is NFS mounted on all hosts
+            \$usecp *:/home  /home
+            EOF
+
+  configure_workers:
+    type: OS::Heat::SoftwareDeploymentGroup
+    properties:
+      config: { get_resource: configure_worker }
+      servers: { get_attr: [midas_workers, attributes, server_id] }
+      signal_transport: HEAT_SIGNAL
+
+  export_torque_nodes:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      outputs:
+        - name: torque_nodes
+      group: script
+      config: |
+        #!/bin/sh
+        (echo -n $(facter hostname); echo -n ' np='; echo -n $(cat /proc/cpuinfo | grep -c ^processor); echo ' num_node_boards=1') > ${heat_outputs_path}.torque_nodes
+
+  export_torque_nodes_from_workers:
+    type: OS::Heat::SoftwareDeploymentGroup
+    properties:
+      config: { get_resource: export_torque_nodes }
+      servers: { get_attr: [midas_workers, attributes, server_id] }
+      signal_transport: HEAT_SIGNAL
+
+  export_hosts:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      outputs:
+        - name: hosts
+      group: script
+      config: |
+        #!/bin/sh
+        (echo -n $(facter ipaddress); echo -n ' '; echo $(facter hostname)) > ${heat_outputs_path}.hosts
+
+  export_hosts_from_workers:
+    type: OS::Heat::SoftwareDeploymentGroup
+    properties:
+      config: { get_resource: export_hosts }
+      servers: { get_attr: [midas_workers, attributes, server_id] }
+      signal_transport: HEAT_SIGNAL
+
+  populate_torque_nodes:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      inputs:
+        - name: torque_nodes
+      group: script
+      config: |
+        #!/usr/bin/env python
+        import ast
+        import os
+        import string
+        import subprocess
+        torque_nodes = os.getenv('torque_nodes')
+        if torque_nodes is not None:
+            torque_nodes = ast.literal_eval(string.replace(torque_nodes, '\n', '\\n'))
+        with open('/var/lib/torque/server_priv/nodes', 'w') as nodes_file:
+          for tn in torque_nodes.values():
+              nodes_file.write("%s\n" % tn.rstrip())
+        subprocess.check_output("systemctl restart pbs_server", shell=True)
+
+  populate_torque_nodes_on_head:
+    type: OS::Heat::SoftwareDeployment
+    depends_on: [ export_torque_nodes_from_workers, configure_workers ]
+    properties:
+      config: { get_resource: populate_torque_nodes }
+      server: { get_resource: midas_head }
+      signal_transport: HEAT_SIGNAL
+      input_values:
+        torque_nodes: { get_attr: [ export_torque_nodes_from_workers, torque_nodes] }
+
+  start_pbs_mom:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      group: script
+      config: |
+        #!/bin/bash
+        systemctl enable pbs_mom
+        systemctl start pbs_mom
+  
+  start_pbs_mom_on_workers:
+    type: OS::Heat::SoftwareDeploymentGroup
+    depends_on: populate_torque_nodes_on_head
+    properties:
+      config: { get_resource: start_pbs_mom }
+      servers: { get_attr: [midas_workers, attributes, server_id] }
+      signal_transport: HEAT_SIGNAL
+
+  populate_hosts:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      inputs:
+        - name: hosts
+      group: script
+      config: |
+        #!/usr/bin/env python
+        import ast
+        import os
+        import string
+        hosts = os.getenv('hosts')
+        if hosts is not None:
+            hosts = ast.literal_eval(string.replace(hosts, '\n', '\\n'))
+        with open('/etc/hosts', 'a') as hosts_file:
+          for ip_host in hosts.values():
+              hosts_file.write(ip_host.rstrip() + '\n')
+
+  populate_hosts_on_head:
+    type: OS::Heat::SoftwareDeployment
+    depends_on: export_hosts_from_workers
+    properties:
+      config: { get_resource: populate_hosts }
+      server: { get_resource: midas_head }
+      signal_transport: HEAT_SIGNAL
+      input_values:
+        hosts: { get_attr: [ export_hosts_from_workers, hosts ] }
+
+  populate_hosts_on_workers:
+    type: OS::Heat::SoftwareDeploymentGroup
+    depends_on: export_hosts_from_workers
+    properties:
+      config: { get_resource: populate_hosts }
+      servers: { get_attr: [midas_workers, attributes, server_id] }
+      signal_transport: HEAT_SIGNAL
+      input_values:
+        hosts: { get_attr: [ export_hosts_from_workers, hosts ] }
+
+  midas_head:
+    type: OS::Nova::Server
+    properties:
+      name:
+        str_replace:
+          template: stack_name-head
+          params:
+            stack_name: { get_param: "OS::stack_name" }
+      flavor: { get_param: flavor }
+      image: { get_param: image }
+      key_name: { get_param: key_name }
+      user_data_format: SOFTWARE_CONFIG
+      software_config_transport: POLL_SERVER_HEAT
+
+  midas_head_floating_ip:
+    type: OS::Nova::FloatingIP
+    properties:
+      pool: public
+
+  midas_head_ip_association:
+    type: OS::Nova::FloatingIPAssociation
+    properties:
+      floating_ip: { get_resource: midas_head_floating_ip }
+      server_id: { get_resource: midas_head }
+
+  midas_workers:
+    type: OS::Heat::ResourceGroup
+    properties:
+      count: { get_param: midas_worker_count }
+      resource_def:
+        type: server-wrapper.yaml
+        properties:
+          name:
+            str_replace:
+              template: stack_name-worker-%index%
+              params:
+                stack_name: { get_param: "OS::stack_name" }
+          flavor: { get_param: flavor }
+          image: { get_param: image }
+          key_name: { get_param: key_name }
+
+# The parameters section gathers configuration from the user.
+parameters:
+  flavor:
+    type: string
+    default: m1.medium
+    constraints:
+    - custom_constraint: nova.flavor
+  image:
+    type: string
+    default: MIDAS
+    constraints:
+    - custom_constraint: glance.image
+  key_name:
+    type: string
+    description: Name of a KeyPair to enable SSH access to the instance
+    default: default
+    constraints:
+    - custom_constraint: nova.keypair
+  midas_worker_count:
+    type: number
+    description: Number of workers
+    default: 1
+    constraints:
+      - range: { min: 1 }
+        description: There must be at least one worker.
+
+outputs:
+  server_ip:
+    description: Public IP address of the Head node
+    value: { get_attr: [ midas_head_floating_ip, ip ] }
+  client_ips:
+    description: Private IP addresses of the workers
+    value: { get_attr: [ midas_workers, first_address ] }
